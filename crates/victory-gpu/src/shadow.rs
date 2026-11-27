@@ -75,8 +75,11 @@ pub(crate) struct Shadow {
     /// the runtime's, copied whole each time).
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
+    /// title memory there is older than the copy, and how many there are,
+    /// read without the lock (a world submission refreshes thousands of
+    /// ranges, and most find none).
     pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending_len: std::sync::atomic::AtomicUsize,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -131,6 +134,40 @@ fn give_back(v: Vec<u8>) {
 
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
+
+/// The bytes a copy-back reads title memory into: from the pool, given back
+/// when it goes. A world frame copies dozens of ranges back, and a fresh
+/// buffer costs a page fault per 4 KiB of it (the frame report counts them).
+struct Back(Vec<u8>);
+
+impl Back {
+    /// A buffer of `n` bytes.
+    fn new(n: usize) -> Self {
+        let mut bytes = pooled(n);
+        bytes.resize(n, 0);
+        Back(bytes)
+    }
+}
+
+impl std::ops::Deref for Back {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Back {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        give_back(std::mem::take(&mut self.0));
+    }
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -221,8 +258,8 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        let mut title = Back::new(n);
+        if !crate::host::read_into(from as *const u8, &mut title) || title[..] == *host {
             return 0;
         }
         {
@@ -260,6 +297,7 @@ impl Shadow {
             len,
             tracked,
             pending: Mutex::default(),
+            pending_len: std::sync::atomic::AtomicUsize::new(0),
             before: Mutex::default(),
             marks,
             base: slice.map_or(0, |s| s.offset),
@@ -324,10 +362,18 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
+        // The counter is the fast path's hint for "nothing pending": it has
+        // to move *inside* the lock that `pending` moves under, or a reader
+        // (another thread's copy-back) sees 0 while a range is already in the
+        // set and takes the snapshot path without it - a range that then has
+        // no snapshot, and a count that drifts below the set's size.
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.insert((address, address + len)) {
+                self.pending_len
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -421,7 +467,7 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            let mut title = Back::new(PIECE);
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -457,14 +503,17 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                synced.retain(|p| (first..last).contains(p));
+                t.taken(&synced);
             }
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.remove(&(address, address + len));
+        if pending.remove(&(address, address + len)) {
+            self.pending_len
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
         if pending.is_empty() {
             compared.clear();
             for (_, bytes) in segments.drain(..) {
@@ -508,7 +557,7 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
+        let mut title = Back::new(n);
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
@@ -556,14 +605,23 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // Most ranges refreshed in a submission have none: ask the count
+        // first, not the lock.
+        let mut busy: Vec<(usize, usize)> = if self
+            .pending_len
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if self.tracked.is_some() {
             return self.update_tracked(from, to, !busy.is_empty());
         }
