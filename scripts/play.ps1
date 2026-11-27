@@ -11,8 +11,9 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090 or laptop
-#               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
+# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090, laptop or gtx1650
+#               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md;
+#                gtx1650: 4 GB Turing laptop / 4C8T CPU / 32 GB RAM, Series S + on-demand mip tiles)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
 # with one override at a time, e.g. -More @{VICTORY_LAND_THREADS='3'} for
@@ -32,7 +33,7 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop', 'gtx1650')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -46,9 +47,14 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
+$hasGtx1650 = [bool]($controllers | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' -and $_.Name -match '\bGTX\s+1650\b' })
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D and 4070 Ti SUPER profiles are explicit.
-    $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
+    # Use the existing vendor defaults, except auto-pick gtx1650 on a 4 GB GTX 1650
+    # so it never launches with the 4090's 26-thread / 3 GB target-reservation defaults.
+    $Machine = if ($hasGtx1650) { 'gtx1650' } elseif ($hasNvidia) { '4090' } else { '7900xtx' }
+}
+if ($Machine -eq 'gtx1650' -and -not $PSBoundParameters.ContainsKey('Console')) {
+    $Console = 'series-s'
 }
 if ($Machine -eq '7900xtx') {
     # i9-12900K, RX 7900 XTX, 64 GB: the page-mapping lock was fastest with one
@@ -137,6 +143,24 @@ if ($Machine -eq 'laptop') {
     # No RAM throttle and no change to the title's watchdog here: the world load fits with the
     # settings above (docs/laptop-16gb.md); for longer sessions see #96 and #126 there.
 }
+if ($Machine -eq 'gtx1650') {
+    # i5-9300H (4C/8T), NVIDIA GeForce GTX 1650 (4 GB VRAM, Turing, no ReBAR), 32 GB RAM.
+    # Tuned to keep textures + render targets inside ~3.4 GB DXGI VRAM budget without starving
+    # either textures or the 4-core CPU's game threads.
+    $settings.VICTORY_THIN_THREADS = '4'; $settings.VICTORY_UNDER_THREADS = '3'; $settings.VICTORY_LAND_THREADS = '2'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '2'
+    $settings.VICTORY_DSTORAGE_IO = 'direct'; $settings.VICTORY_INPLACE = '2'
+    $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_WINDOW_TAILS = '1'
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '128'
+    $settings.VICTORY_CARD_WINDOWS_MB = '128'
+    # Default target reservation (3,072 MB) exceeds most of a 4 GB card's DXGI budget and starves
+    # textures; 768 MB fits half-scale Series S targets while leaving ~2.2+ GB for mip-tiled textures.
+    $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '768'; $settings.VICTORY_TEXTURE_ROOM_PERCENT = '88'
+    $settings.VICTORY_LEVELS_ON_DEMAND = '1'; $settings.VICTORY_LEVELS_MIN_KB = '256'
+    # Crisp 1080p output rendered at 50% internal scale (960x540) with the title's upscaler;
+    # pass -Fsr balanced (or performance) + -FrameGen when AMD FSR 3.1.6 DLLs are installed.
+    $settings.VICTORY_OUTPUT = '1920x1080'; $settings.VICTORY_UPSCALER = '6'; $settings.VICTORY_RENDER_SCALE = '0.5'
+}
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
@@ -153,7 +177,7 @@ if (-not $Windowed) { $settings.VICTORY_FULLSCREEN = '1' }
 # corner, so clips and screenshots show what the build runs at and on what PC.
 if (-not $NoPanel) { $settings.VICTORY_PANEL = '1' }
 if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1' }
-if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER') }
+if ($Fsr -or $Dlss) { $settings.Remove('VICTORY_UPSCALER'); $settings.Remove('VICTORY_RENDER_SCALE') }
 if ($Fsr) { $settings.VICTORY_FSR = $Fsr.ToLowerInvariant() }
 if ($Dlss) { $settings.VICTORY_DLSS = $Dlss.ToLowerInvariant() }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
@@ -161,7 +185,7 @@ if ($Dlss4K) { $settings.VICTORY_DLSS_4K = $Dlss4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 Write-Host "Settings for the $Machine$(if ($Safe) { ', safe' })$(if ($RayTracing) { ', with ray tracing' })."
-if ($Console -eq 'series-s' -and $Machine -in '4090', 'laptop') {
+if ($Console -eq 'series-s' -and $Machine -in '4090', 'laptop', 'gtx1650') {
     Write-Host ("Series S requests {0} list translation threads, {1} for memory updates, and {2} for landing." -f
         $settings.VICTORY_THIN_THREADS, $settings.VICTORY_UNDER_THREADS, $settings.VICTORY_LAND_THREADS)
 }
