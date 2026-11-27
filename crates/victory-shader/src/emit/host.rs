@@ -64,6 +64,75 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
+/// can list the Microsoft Basic Render Driver, which is WARP, as an
+/// ordinary adapter without the software flag: its ids, or its name, tell.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
+}
+
+/// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
+/// order: each one's description.
+///
+/// A run can be kept off a card: `VICTORY_TEST_ADAPTERS=<part of a
+/// name>[,<part>...]` lists only the adapters whose description holds one
+/// of the parts (ignoring case), and without it `VICTORY_ADAPTER=<part>`
+/// (which picks the device of [`Host::new`]) does the same, so
+/// `VICTORY_ADAPTER=radeon` keeps a whole test run on that adapter.
+/// `VICTORY_WARP=1` lists none: a software-renderer run touches no hardware
+/// adapter. An adapter that is left out is not opened at all. An integrated GPU with narrower waves
+/// (some Intel ones report 16-16) runs none of the console's programs
+/// that depend on the wave size: the translator refuses them for it by
+/// name, and what walks this list expects a pipeline. An adapter no SM 6.6
+/// device can be made on stays listed, for its user to skip.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    let mut out = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if hardware(&d) {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        out
+    };
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        return Ok(Vec::new());
+    }
+    let only = std::env::var("VICTORY_TEST_ADAPTERS")
+        .or_else(|_| std::env::var("VICTORY_ADAPTER"))
+        .unwrap_or_default();
+    let only: Vec<String> = only
+        .split(',')
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if !only.is_empty() {
+        out.retain(|name| {
+            let name = name.to_lowercase();
+            only.iter().any(|part| name.contains(part))
+        });
+    }
+    out.retain(|name| {
+        Host::on(name).map_or(true, |host| {
+            let target = host.target();
+            target.runs(32) || target.runs(64)
+        })
+    });
+    Ok(out)
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
 /// A D3D12 device kept alive for the process so concurrent callers do not
 /// race creating and tearing down the same singleton adapter device.
 struct SharedDevice(ID3D12Device);
@@ -74,7 +143,9 @@ unsafe impl Send for SharedDevice {}
 // SAFETY: as above.
 unsafe impl Sync for SharedDevice {}
 
-fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+/// A device on WARP with `warp`, else on `adapter`, else on the default
+/// hardware adapter.
+fn create_device(warp: bool, adapter: Option<IDXGIAdapter1>) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;
@@ -82,6 +153,8 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
             factory.EnumWarpAdapter().map_err(err)?
+        } else if let Some(adapter) = adapter {
+            adapter
         } else {
             hardware_adapter(&factory).map_err(err)?
         };
@@ -199,7 +272,9 @@ impl Host {
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the first hardware adapter whose description holds
+    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -208,7 +283,7 @@ impl Host {
             static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
             let shared = WARP.get_or_init(|| {
                 let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                create_device(true).map(SharedDevice)
+                create_device(true, None).map(SharedDevice)
             });
             return shared
                 .as_ref()
@@ -218,8 +293,38 @@ impl Host {
                 })
                 .map_err(Clone::clone);
         }
+        if let Ok(name) = std::env::var("VICTORY_ADAPTER")
+            && !name.is_empty()
+        {
+            return Self::on(&name);
+        }
         Ok(Host {
-            device: create_device(false)?,
+            device: create_device(false, None)?,
+            warp: false,
+        })
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        Ok(Host {
+            device: create_device(false, Some(adapter))?,
             warp: false,
         })
     }
@@ -229,6 +334,30 @@ impl Host {
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
         Host { device, warp }
+    }
+
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
+        }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -832,6 +961,8 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
         view_marks: false,
     })?;
     Ok(HostShader {

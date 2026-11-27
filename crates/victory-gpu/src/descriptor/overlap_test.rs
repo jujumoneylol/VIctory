@@ -89,7 +89,16 @@ fn shader(write: bool, field: usize) -> HostShader {
         version: (1, 0),
         parts: Vec::new(),
     };
-    let emitted = victory_shader::emit::emit(&signatures, &native, &ir, &st, &io, &res).unwrap();
+    let emitted = victory_shader::emit::emit(
+        &signatures,
+        &native,
+        &ir,
+        &st,
+        &io,
+        &res,
+        victory_shader::emit::Target::ANY,
+    )
+    .unwrap();
     assert!(emitted.heap && emitted.heap_writes == write);
     assert_eq!(emitted.root_srvs, [VIEW_STRIDES]);
     emitted

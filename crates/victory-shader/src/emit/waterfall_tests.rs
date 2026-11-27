@@ -16,6 +16,20 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    let lowered = lower_as(words, buffers, false).expect("lower");
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
+    assert!(!lowered.wave_ops);
+    host_shader(lowered)
+}
+
+/// [`build`]'s program lowered in the per-lane form, or with `console_cf`
+/// in the console flow (`lower::CONSOLE_FLOW`).
+fn lower_as(
+    words: &[u32],
+    buffers: bool,
+    console_cf: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -59,22 +73,25 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let console = structure::structure_console(&p).expect("structure_console");
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
-        st: &st,
+        st: if console_cf { &console } else { &st },
         io: &io,
         res: &res,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf,
         view_marks: false,
     })
-    .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+}
+
+/// The host shader of `lowered`, validated by `dxil.dll` when present.
+fn host_shader(lowered: lower::Lowered) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -266,5 +283,23 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+/// In the console flow every lane reaches a join by the edge the wave took,
+/// so the edge does not say which descriptor a lane holds. Lowered there,
+/// all 32 lanes sampled the second texture where lanes 0-15 hold the first
+/// (RTX 5070).
+/// The console flow refuses it by name, and `emit` keeps the per-lane form
+/// where that translates.
+#[test]
+fn the_console_flow_refuses_descriptors_joined_per_lane() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    match lower_as(WATERFALL_JOINED_WAVE32, false, true) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => {
+            assert_eq!(what, lower::LANE_PHI_IN_CONSOLE_FLOW);
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("lowered in the console flow"),
     }
 }
