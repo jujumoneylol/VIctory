@@ -174,6 +174,27 @@ impl Changed {
 /// Byte runs `[start, end)` in order.
 pub(crate) type Runs = Vec<(usize, usize)>;
 
+/// Splits changed pages into copy and zero-fill runs. Both inputs are in
+/// ascending order, and `unmapped` is a subset of `pages`, so each absent
+/// page only needs to be checked once.
+fn split_page_runs(pages: &[usize], mut unmapped: &[usize], from: usize, to: usize) -> (Runs, Runs) {
+    let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+    for &p in pages {
+        let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+        let runs = if let Some(rest) = unmapped.strip_prefix(&[p]) {
+            unmapped = rest;
+            &mut zero
+        } else {
+            &mut copy
+        };
+        match runs.last_mut() {
+            Some((_, end)) if *end == a => *end = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    (copy, zero)
+}
+
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
     start: usize,
@@ -519,16 +540,9 @@ impl Tracked {
         set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
-        let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
-        for p in pages {
-            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
-            match runs.last_mut() {
-                Some((_, end)) if *end == a => *end = b,
-                _ => runs.push((a, b)),
-            }
-        }
-        (copy, zero)
+        // `whole` keeps the order of `pages`, and `protect_noting` reports
+        // its unmapped pages in that same order.
+        split_page_runs(&pages, &unmapped, from, to)
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -958,6 +972,15 @@ pub(crate) mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn page_runs_preserve_missing_pages_gaps_and_partial_bounds() {
+        let from = 2 * PAGE + 7;
+        let to = 8 * PAGE - 3;
+        let (copy, zero) = split_page_runs(&[2, 3, 5, 6, 7], &[3, 5, 6], from, to);
+        assert_eq!(copy, [(from, 3 * PAGE), (7 * PAGE, to)]);
+        assert_eq!(zero, [(3 * PAGE, 4 * PAGE), (5 * PAGE, 7 * PAGE)]);
+    }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).

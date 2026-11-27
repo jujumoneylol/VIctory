@@ -2301,6 +2301,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -2315,25 +2316,23 @@ impl HostList {
                     Step::Memory(_) => C::StepMemoryUs,
                 },
             );
-            let copied = match step {
-                &Step::Copy(dst, src, len) => {
+            match step {
+                &Step::Copy(dst, src, len) | &Step::Fill(dst, src, len) => {
+                    // Only copies and fills report their time in release builds.
+                    #[cfg(not(feature = "diagnostics"))]
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    len
-                }
-                &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                    let title_dst = matches!(step, Step::Copy(..));
+                    if title_dst {
+                        batch.title_written();
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+                    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2342,7 +2341,6 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
@@ -2354,7 +2352,6 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len, marked, _) => {
                     // The shaders start from the title's data, which a
@@ -2363,21 +2360,16 @@ impl HostList {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
-                    continue;
                 }
                 // Brought up to date before the submission's lists were made.
-                Step::Texture(..) => continue,
+                Step::Texture(..) => {}
                 Step::Heap(viewed) => {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
-                    continue;
                 }
                 &Step::Memory(heap) => {
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
