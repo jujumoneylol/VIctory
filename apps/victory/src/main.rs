@@ -113,8 +113,10 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        /// The console model the title sees (device type, memory):
+        /// series-x or series-s, or auto — the one the first adapter's
+        /// dedicated video memory names (12 GiB or less: series-s).
+        #[arg(long, value_enum, default_value_t = Console::Auto)]
         console: Console,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
@@ -135,6 +137,7 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+    Auto,
 }
 
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.

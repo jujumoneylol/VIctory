@@ -153,12 +153,14 @@ victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+            [--console series-x|series-s|auto] [-- <title arguments>]
 victory config
 ```
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
+
+`--console auto` is the default and picks the series-s profile when the high-performance adapter has 12 GiB of dedicated video memory or less, series-x otherwise or when the query fails.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

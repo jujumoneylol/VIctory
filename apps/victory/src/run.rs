@@ -110,11 +110,26 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
-    println!("console        {}", victory_hle::console::current().name());
+    // Which console the title sees, before it starts: `auto` follows the
+    // first adapter's dedicated video memory (12 GiB or less: series-s;
+    // no answer: series-x, as before).
+    let (console, auto) = match console {
+        Console::SeriesX => (victory_hle::console::Console::SeriesX, false),
+        Console::SeriesS => (victory_hle::console::Console::SeriesS, false),
+        Console::Auto => {
+            let (chosen, dedicated) = victory_gpu::console::profile_by_adapter();
+            let by = dedicated.map_or_else(
+                || "adapter memory unavailable".to_owned(),
+                |bytes| format!("{} MiB of dedicated video memory", bytes >> 20),
+            );
+            println!("console        {} (auto: {by})", chosen.name());
+            (chosen, true)
+        }
+    };
+    victory_hle::console::set(console);
+    if !auto {
+        println!("console        {}", victory_hle::console::current().name());
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
